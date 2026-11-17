@@ -1,0 +1,16 @@
+.vscode/
+/build/
+/out/
+/output-*/
+/CMakeFiles/
+/CMakeCache.txt
+*.obj
+*.o
+*.a
+*.lib
+*.sys
+*.pdb
+*.ilk
+*.cat
+*.iso
+*.qcow2
