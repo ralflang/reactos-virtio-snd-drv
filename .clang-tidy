@@ -1,0 +1,54 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  clang-analyzer-*,
+
+  # Useful ReactOS/Win32 specific checks
+  bugprone-sizeof-expression,
+  bugprone-macro-parentheses,
+  bugprone-suspicious-semicolon,
+  bugprone-branch-clone,
+  bugprone-infinite-loop,
+  bugprone-use-after-move,
+
+  readability-braces-around-statements,
+  readability-identifier-naming,
+  readability-isolate-declaration,
+  readability-redundant-control-flow,
+
+  performance-for-range-copy,
+  performance-inefficient-vector-operation,
+
+  portability-simd-intrinsics
+
+WarningsAsErrors: >
+
+HeaderFilterRegex: '.*'
+
+CheckOptions:
+
+  # Require braces even where ReactOS allows omission.
+  # Safer in practice.
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '0'
+
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: UPPER_CASE
+
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+
+  # Avoid mixed declarations
+  - key: readability-isolate-declaration.IgnoreSingleVariableStatements
+    value: false
+...
