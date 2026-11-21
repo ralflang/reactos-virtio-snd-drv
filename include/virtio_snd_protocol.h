@@ -362,10 +362,10 @@
  */
 typedef struct _VIRTIO_SND_CONFIG
 {
-    ULONG Jacks;        /**< Number of jacks */
-    ULONG Streams;      /**< Number of streams */
-    ULONG ChannelMaps;  /**< Number of channel maps */
-    ULONG Controls;     /**< Number of controls */
+    ULONG Jacks;       /**< Number of jacks */
+    ULONG Streams;     /**< Number of streams */
+    ULONG ChannelMaps; /**< Number of channel maps */
+    ULONG Controls;    /**< Number of controls */
 } VIRTIO_SND_CONFIG, *PVIRTIO_SND_CONFIG;
 
 /**
@@ -375,7 +375,7 @@ typedef struct _VIRTIO_SND_CONFIG
  */
 typedef struct _VIRTIO_SND_HDR
 {
-    ULONG Code;         /**< Message code */
+    ULONG Code; /**< Message code */
 } VIRTIO_SND_HDR, *PVIRTIO_SND_HDR;
 
 /**
@@ -385,8 +385,8 @@ typedef struct _VIRTIO_SND_HDR
  */
 typedef struct _VIRTIO_SND_EVENT
 {
-    VIRTIO_SND_HDR Header;  /**< Event header */
-    ULONG Data;             /**< Event data */
+    VIRTIO_SND_HDR Header; /**< Event header */
+    ULONG Data;            /**< Event data */
 } VIRTIO_SND_EVENT, *PVIRTIO_SND_EVENT;
 
 /**
@@ -396,8 +396,8 @@ typedef struct _VIRTIO_SND_EVENT
  */
 typedef struct _VIRTIO_SND_PCM_HDR
 {
-    VIRTIO_SND_HDR Header;  /**< PCM header */
-    ULONG StreamId;         /**< Stream identifier */
+    VIRTIO_SND_HDR Header; /**< PCM header */
+    ULONG StreamId;        /**< Stream identifier */
 } VIRTIO_SND_PCM_HDR, *PVIRTIO_SND_PCM_HDR;
 
 /**
@@ -407,14 +407,14 @@ typedef struct _VIRTIO_SND_PCM_HDR
  */
 typedef struct _VIRTIO_SND_PCM_SET_PARAMS
 {
-    VIRTIO_SND_PCM_HDR Header;  /**< PCM header */
-    ULONG BufferBytes;          /**< Buffer size in bytes */
-    ULONG PeriodBytes;          /**< Period size in bytes */
-    ULONG Features;             /**< Features supported */
-    UCHAR Channels;             /**< Number of channels */
-    UCHAR Format;               /**< PCM format */
-    UCHAR Rate;                 /**< Sample rate */
-    UCHAR Padding;              /**< Padding bytes */
+    VIRTIO_SND_PCM_HDR Header; /**< PCM header */
+    ULONG BufferBytes;         /**< Buffer size in bytes */
+    ULONG PeriodBytes;         /**< Period size in bytes */
+    ULONG Features;            /**< Features supported */
+    UCHAR Channels;            /**< Number of channels */
+    UCHAR Format;              /**< PCM format */
+    UCHAR Rate;                /**< Sample rate */
+    UCHAR Padding;             /**< Padding bytes */
 } VIRTIO_SND_PCM_SET_PARAMS, *PVIRTIO_SND_PCM_SET_PARAMS;
 
 /**
@@ -424,10 +424,10 @@ typedef struct _VIRTIO_SND_PCM_SET_PARAMS
  */
 typedef struct _VIRTIO_SND_QUERY_INFO
 {
-    VIRTIO_SND_HDR Header;  /**< Query header */
-    ULONG StartId;          /**< Starting ID */
-    ULONG Count;            /**< Number of entries */
-    ULONG Size;             /**< Size of each entry */
+    VIRTIO_SND_HDR Header; /**< Query header */
+    ULONG StartId;         /**< Starting ID */
+    ULONG Count;           /**< Number of entries */
+    ULONG Size;            /**< Size of each entry */
 } VIRTIO_SND_QUERY_INFO, *PVIRTIO_SND_QUERY_INFO;
 
 /**
@@ -437,7 +437,7 @@ typedef struct _VIRTIO_SND_QUERY_INFO
  */
 typedef struct _VIRTIO_SND_INFO
 {
-    ULONG HdaFunctionNodeId;    /**< HDA function node ID */
+    ULONG HdaFunctionNodeId; /**< HDA function node ID */
 } VIRTIO_SND_INFO, *PVIRTIO_SND_INFO;
 
 /**
@@ -447,14 +447,14 @@ typedef struct _VIRTIO_SND_INFO
  */
 typedef struct _VIRTIO_SND_PCM_INFO
 {
-    VIRTIO_SND_INFO Header;     /**< Info header */
-    ULONG Features;             /**< Stream features */
-    ULONGLONG Formats;          /**< Supported formats */
-    ULONGLONG Rates;            /**< Supported rates */
-    UCHAR Direction;            /**< Stream direction */
-    UCHAR ChannelsMin;          /**< Minimum channels */
-    UCHAR ChannelsMax;          /**< Maximum channels */
-    UCHAR Padding[5];           /**< Padding bytes */
+    VIRTIO_SND_INFO Header; /**< Info header */
+    ULONG Features;         /**< Stream features */
+    ULONGLONG Formats;      /**< Supported formats */
+    ULONGLONG Rates;        /**< Supported rates */
+    UCHAR Direction;        /**< Stream direction */
+    UCHAR ChannelsMin;      /**< Minimum channels */
+    UCHAR ChannelsMax;      /**< Maximum channels */
+    UCHAR Padding[5];       /**< Padding bytes */
 } VIRTIO_SND_PCM_INFO, *PVIRTIO_SND_PCM_INFO;
 
 /**
@@ -464,9 +464,9 @@ typedef struct _VIRTIO_SND_PCM_INFO
  */
 typedef struct _VIRTIO_SND_CHMAP_INFO
 {
-    VIRTIO_SND_INFO Header;     /**< Info header */
-    UCHAR Direction;            /**< Channel direction */
-    UCHAR Channels;             /**< Number of channels */
+    VIRTIO_SND_INFO Header;                     /**< Info header */
+    UCHAR Direction;                            /**< Channel direction */
+    UCHAR Channels;                             /**< Number of channels */
     UCHAR Positions[VIRTIO_SND_CHMAP_MAX_SIZE]; /**< Channel positions */
 } VIRTIO_SND_CHMAP_INFO, *PVIRTIO_SND_CHMAP_INFO;
 
@@ -487,7 +487,7 @@ C_ASSERT(sizeof(VIRTIO_SND_CHMAP_INFO) == 24);
  */
 typedef struct _VIRTIO_SND_PCM_XFER
 {
-    ULONG StreamId;     /**< Stream identifier */
+    ULONG StreamId; /**< Stream identifier */
 } VIRTIO_SND_PCM_XFER, *PVIRTIO_SND_PCM_XFER;
 
 /**

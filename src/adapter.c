@@ -5,7 +5,7 @@
  * COPYRIGHT:   Copyright 2026 Ralf Lang <ralf.lang@ralf-lang.de>
  */
 
- /**
+/**
  * @file
  * @brief PnP handling for VirtIO Sound Driver
  *
