@@ -17,10 +17,11 @@ function(_configure_virtiosnd)
         "${VIRTIO_SND_SOURCE_DIR}/src/adapter.c"
         "${VIRTIO_SND_SOURCE_DIR}/src/audio_controls.c"
         "${VIRTIO_SND_SOURCE_DIR}/src/driver.c"
-        "${VIRTIO_SND_SOURCE_DIR}/src/transport.c"
         "${VIRTIO_SND_SOURCE_DIR}/src/topology.cpp"
+        "${VIRTIO_SND_SOURCE_DIR}/src/transport.c"
+        "${VIRTIO_SND_SOURCE_DIR}/src/virtio_debug.c"
         "${VIRTIO_SND_SOURCE_DIR}/src/wavecyclic.cpp"
-        "${VIRTIO_SND_SOURCE_DIR}/src/virtio_debug.c")
+        )
 
     target_include_directories(virtiosnd PRIVATE
         "${VIRTIO_SND_SOURCE_DIR}/include"
