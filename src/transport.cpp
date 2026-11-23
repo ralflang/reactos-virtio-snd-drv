@@ -5,119 +5,33 @@
  * COPYRIGHT:   Copyright 2026 Ralf Lang <ralf.lang@ralf-lang.de>
  */
 
-#include "virtio_snd_protocol.h"
-#include "virtiosnd.h"
-#include <stdbool.h>
+#include "adapter.hpp"
 
-#ifdef FORCEINLINE
-#undef FORCEINLINE
-#endif
-#if defined(__GNUC__)
-#define FORCEINLINE __attribute__((unused))
-#else
-#define FORCEINLINE
-#endif
-/* clang-format off */
-/* Cannot let clang alphabetically sort this or we hit a bug: virtio_pci.h defines VirtIODevice and struct virtqueue used by VirtIO.h  */
-#include <virtio_pci.h>
-#include <VirtIO.h>
-/* clang-format on */
-#undef FORCEINLINE
-
-NTKERNELAPI
-PDEVICE_OBJECT
-NTAPI
-IoGetDeviceAttachmentBaseRef(_In_ PDEVICE_OBJECT DeviceObject);
+extern "C"
+{
+    NTKERNELAPI
+    PDEVICE_OBJECT
+    NTAPI
+    IoGetDeviceAttachmentBaseRef(_In_ PDEVICE_OBJECT DeviceObject);
+}
 
 #define VIRTIO_SND_PCI_VENDOR_ID 0x1AF4
 #define VIRTIO_SND_PCI_DEVICE_ID 0x1059
-#define VIRTIO_SND_POOL_TAG 'dSnV'
 #define VIRTIO_SND_IO_PORT_MAX 0xFFFF
 #define VIRTIO_SND_CONTROL_TIMEOUT_MS 2000
-#define VIRTIO_SND_TX_SLOT_COUNT 4
-#define VIRTIO_SND_EVENT_SLOT_COUNT 16
 #define VIRTIO_SND_ISR_QUEUE 0x01
 
-typedef struct _VIRTIO_SND_TX_SLOT
-{
-    VIRTIO_SND_PCM_XFER Request;
-    UCHAR Audio[VIRTIO_SND_PCM_PERIOD_BYTES];
-    VIRTIO_SND_PCM_STATUS Response;
-    BOOLEAN InFlight;
-} VIRTIO_SND_TX_SLOT, *PVIRTIO_SND_TX_SLOT;
+/* Master volume/mute control range (formerly audio_controls.c). */
+#define VIRTIO_SND_VOLUME_MINIMUM (-9600)
+#define VIRTIO_SND_VOLUME_MAXIMUM 0
+#define VIRTIO_SND_VOLUME_STEP 100
+#define VIRTIO_SND_GAIN_ONE_DB_Q16 58410
 
-typedef struct _VIRTIO_SND_EVENT_SLOT
-{
-    VIRTIO_SND_EVENT Event;
-} VIRTIO_SND_EVENT_SLOT, *PVIRTIO_SND_EVENT_SLOT;
-
-struct _VIRTIO_SND_PLAYBACK
-{
-    ULONG StreamId;
-    ULONG Channels;
-    ULONG Features;
-    ULONG InFlightCount;
-    PKEVENT WakeEvent;
-    BOOLEAN Prepared;
-    BOOLEAN Started;
-    BOOLEAN DeviceActive;
-#if defined(VIRTIO_SND_TEST_XRUN_INJECTION)
-    volatile LONG TestXrunInjected;
-#endif
-    PVIRTIO_SND_TX_SLOT Slots[VIRTIO_SND_TX_SLOT_COUNT];
-};
-
+/*
+ * Serialize transport lifecycle operations across per-device adapter instances.
+ */
 static ULONG_PTR VirtioSndTraceNotifyAddress;
-
-typedef struct _VIRTIO_SND_BAR
-{
-    PHYSICAL_ADDRESS BaseAddress;
-    SIZE_T Length;
-    PVOID MappedAddress;
-    BOOLEAN IsPort;
-    BOOLEAN Assigned;
-} VIRTIO_SND_BAR, *PVIRTIO_SND_BAR;
-
-typedef struct _VIRTIO_SND_TRANSPORT
-{
-    ULONG BusNumber;
-    PCI_SLOT_NUMBER SlotNumber;
-    VIRTIO_SND_BAR Bars[PCI_TYPE0_ADDRESSES];
-} VIRTIO_SND_TRANSPORT, *PVIRTIO_SND_TRANSPORT;
-
-typedef struct _VIRTIO_SND_ADAPTER
-{
-    PDEVICE_OBJECT OwnerDeviceObject;
-    VIRTIO_SND_TRANSPORT Transport;
-    VirtIODevice Device;
-    VIRTIO_SND_CONFIG Config;
-    ULONGLONG HostFeatures;
-    ULONGLONG DriverFeatures;
-    struct virtqueue *Queues[VIRTIO_SND_VQ_MAX];
-    PVIRTIO_SND_PCM_INFO PcmInfo;
-    ULONG PcmInfoCount;
-    PVIRTIO_SND_CHMAP_INFO ChannelMapInfo;
-    ULONG ChannelMapInfoCount;
-    PVIRTIO_SND_EVENT_SLOT EventSlots;
-    ULONG EventSlotCount;
-    PVOID OutstandingBuffer;
-    BOOLEAN DeviceInitializeAttempted;
-    BOOLEAN DeviceInitialized;
-    BOOLEAN QueuesInitialized;
-    BOOLEAN Started;
-    PKINTERRUPT InterruptObject;
-    KDPC InterruptDpc;
-    KSPIN_LOCK PlaybackLock;
-    PKEVENT PlaybackEvent;
-    PVIRTIO_SND_PLAYBACK PlaybackContext;
-    volatile LONG Stopping;
-    LONG PlaybackOpen;
-} VIRTIO_SND_ADAPTER, *PVIRTIO_SND_ADAPTER;
-
-static VIRTIO_SND_ADAPTER VirtioSndAdapter;
 static KMUTEX VirtioSndLifecycleMutex;
-static KEVENT VirtioSndPlaybackQuiesced;
-static KEVENT VirtioSndTransportStopped;
 static LONG VirtioSndSynchronizationInitialized;
 
 static VOID
@@ -126,8 +40,6 @@ VirtioSndInitializeSynchronization(VOID)
     if (InterlockedCompareExchange(&VirtioSndSynchronizationInitialized, 1, 0) == 0)
     {
         KeInitializeMutex(&VirtioSndLifecycleMutex, 0);
-        KeInitializeEvent(&VirtioSndPlaybackQuiesced, NotificationEvent, TRUE);
-        KeInitializeEvent(&VirtioSndTransportStopped, NotificationEvent, TRUE);
         InterlockedExchange(&VirtioSndSynchronizationInitialized, 2);
     }
     else
@@ -152,58 +64,77 @@ VirtioSndReleaseLifecycleLock(VOID)
 }
 
 BOOLEAN
-VirtioSndTransportStopping(VOID)
+CVirtioSndAdapter::TransportStopping(VOID)
 {
-    return InterlockedCompareExchange(&VirtioSndAdapter.Stopping, 0, 0) != FALSE || !VirtioSndAdapter.Started;
+    return InterlockedCompareExchange(&Stopping, 0, 0) != FALSE || !Started;
 }
 
 VOID
-VirtioSndPlaybackWorkerQuiesced(VOID)
+CVirtioSndAdapter::PlaybackWorkerQuiesced(VOID)
 {
-    KeSetEvent(&VirtioSndPlaybackQuiesced, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&PlaybackQuiesced, IO_NO_INCREMENT, FALSE);
 }
 
-static VOID NTAPI
-VirtioSndInterruptDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2)
+VOID
+CVirtioSndAdapter::OnInterruptDpc(VOID)
 {
-    PVIRTIO_SND_ADAPTER Adapter = (PVIRTIO_SND_ADAPTER)DeferredContext;
-
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    KeAcquireSpinLockAtDpcLevel(&Adapter->PlaybackLock);
-    if (Adapter->PlaybackEvent != NULL)
+    KeAcquireSpinLockAtDpcLevel(&PlaybackLock);
+    if (PlaybackEvent != NULL)
     {
-        KeSetEvent(Adapter->PlaybackEvent, IO_NO_INCREMENT, FALSE);
+        KeSetEvent(PlaybackEvent, IO_NO_INCREMENT, FALSE);
     }
-    KeReleaseSpinLockFromDpcLevel(&Adapter->PlaybackLock);
+    KeReleaseSpinLockFromDpcLevel(&PlaybackLock);
 }
 
-static BOOLEAN NTAPI
-VirtioSndInterruptService(_In_ PKINTERRUPT Interrupt, _In_opt_ PVOID ServiceContext)
+BOOLEAN
+CVirtioSndAdapter::OnInterruptService(VOID)
 {
-    PVIRTIO_SND_ADAPTER Adapter = (PVIRTIO_SND_ADAPTER)ServiceContext;
     UCHAR InterruptStatus;
 
-    UNREFERENCED_PARAMETER(Interrupt);
-
-    if (!Adapter->DeviceInitialized)
+    if (!DeviceInitialized)
         return FALSE;
 
-    InterruptStatus = virtio_read_isr_status(&Adapter->Device);
+    InterruptStatus = virtio_read_isr_status(&Device);
     if ((InterruptStatus & (VIRTIO_SND_ISR_QUEUE | VIRTIO_PCI_ISR_CONFIG)) == 0)
         return FALSE;
 
     if ((InterruptStatus & VIRTIO_SND_ISR_QUEUE) != 0)
-        KeInsertQueueDpc(&Adapter->InterruptDpc, NULL, NULL);
+        KeInsertQueueDpc(&InterruptDpc, NULL, NULL);
 
     return TRUE;
 }
+
+/* C linkage thunks for the kernel ISR/DPC: Recover the adapter from context. */
+extern "C"
+{
+
+    static VOID NTAPI
+    VirtioSndInterruptDpc(
+        _In_ PKDPC Dpc,
+        _In_opt_ PVOID DeferredContext,
+        _In_opt_ PVOID SystemArgument1,
+        _In_opt_ PVOID SystemArgument2)
+    {
+        CVirtioSndAdapter *Adapter = static_cast<CVirtioSndAdapter *>(DeferredContext);
+
+        UNREFERENCED_PARAMETER(Dpc);
+        UNREFERENCED_PARAMETER(SystemArgument1);
+        UNREFERENCED_PARAMETER(SystemArgument2);
+
+        Adapter->OnInterruptDpc();
+    }
+
+    static BOOLEAN NTAPI
+    VirtioSndInterruptService(_In_ PKINTERRUPT Interrupt, _In_opt_ PVOID ServiceContext)
+    {
+        CVirtioSndAdapter *Adapter = static_cast<CVirtioSndAdapter *>(ServiceContext);
+
+        UNREFERENCED_PARAMETER(Interrupt);
+
+        return Adapter->OnInterruptService();
+    }
+
+} /* extern "C" */
 
 static UCHAR
 VirtioSndReadByte(_In_ ULONG_PTR Register)
@@ -344,7 +275,7 @@ VirtioSndFreeNonpaged(_In_ PVOID Context, _In_ PVOID Memory)
 }
 
 static NTSTATUS
-VirtioSndSubmitEventSlot(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _Inout_ PVIRTIO_SND_EVENT_SLOT Slot)
+VirtioSndSubmitEventSlot(_Inout_ CVirtioSndAdapter *Adapter, _Inout_ PVIRTIO_SND_EVENT_SLOT Slot)
 {
     struct scatterlist ScatterList;
     INT AddResult;
@@ -363,7 +294,7 @@ VirtioSndSubmitEventSlot(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _Inout_ PVIRTIO_SN
 }
 
 static NTSTATUS
-VirtioSndInitializeEventQueue(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
+VirtioSndInitializeEventQueue(_Inout_ CVirtioSndAdapter *Adapter)
 {
     ULONG QueueSize;
     ULONG SlotIndex;
@@ -373,7 +304,8 @@ VirtioSndInitializeEventQueue(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
     if (Adapter->EventSlotCount == 0)
         return STATUS_DEVICE_CONFIGURATION_ERROR;
 
-    Adapter->EventSlots = VirtioSndAllocateContiguous(NULL, Adapter->EventSlotCount * sizeof(*Adapter->EventSlots));
+    Adapter->EventSlots = (PVIRTIO_SND_EVENT_SLOT)VirtioSndAllocateContiguous(
+        NULL, Adapter->EventSlotCount * sizeof(*Adapter->EventSlots));
     if (Adapter->EventSlots == NULL)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -414,7 +346,7 @@ VirtioSndHandleEvent(
 
 static NTSTATUS
 VirtioSndDrainEventQueue(
-    _Inout_ PVIRTIO_SND_ADAPTER Adapter,
+    _Inout_ CVirtioSndAdapter *Adapter,
     _In_opt_ PVIRTIO_SND_PLAYBACK Playback,
     _Out_ PULONG XrunCount)
 {
@@ -471,25 +403,25 @@ VirtioSndReadPciConfig(_In_ PVIRTIO_SND_TRANSPORT Transport, _In_ INT Offset, _O
 static INT
 VirtioSndReadPciConfigByte(_In_ PVOID Context, _In_ INT Offset, _Out_ UCHAR *Value)
 {
-    return VirtioSndReadPciConfig(Context, Offset, Value, sizeof(*Value));
+    return VirtioSndReadPciConfig((PVIRTIO_SND_TRANSPORT)Context, Offset, Value, sizeof(*Value));
 }
 
 static INT
 VirtioSndReadPciConfigWord(_In_ PVOID Context, _In_ INT Offset, _Out_ USHORT *Value)
 {
-    return VirtioSndReadPciConfig(Context, Offset, Value, sizeof(*Value));
+    return VirtioSndReadPciConfig((PVIRTIO_SND_TRANSPORT)Context, Offset, Value, sizeof(*Value));
 }
 
 static INT
 VirtioSndReadPciConfigDword(_In_ PVOID Context, _In_ INT Offset, _Out_ ULONG *Value)
 {
-    return VirtioSndReadPciConfig(Context, Offset, Value, sizeof(*Value));
+    return VirtioSndReadPciConfig((PVIRTIO_SND_TRANSPORT)Context, Offset, Value, sizeof(*Value));
 }
 
 static size_t
 VirtioSndGetBarLength(_In_ PVOID Context, _In_ INT BarIndex)
 {
-    PVIRTIO_SND_TRANSPORT Transport = Context;
+    PVIRTIO_SND_TRANSPORT Transport = (PVIRTIO_SND_TRANSPORT)Context;
 
     if (BarIndex < 0 || BarIndex >= PCI_TYPE0_ADDRESSES || !Transport->Bars[BarIndex].Assigned)
     {
@@ -502,7 +434,7 @@ VirtioSndGetBarLength(_In_ PVOID Context, _In_ INT BarIndex)
 static PVOID
 VirtioSndMapBar(_In_ PVOID Context, _In_ INT BarIndex, _In_ size_t Offset, _In_ size_t Length)
 {
-    PVIRTIO_SND_TRANSPORT Transport = Context;
+    PVIRTIO_SND_TRANSPORT Transport = (PVIRTIO_SND_TRANSPORT)Context;
     PVIRTIO_SND_BAR Bar;
 
     if (BarIndex < 0 || BarIndex >= PCI_TYPE0_ADDRESSES)
@@ -572,12 +504,11 @@ VirtioSndFindBarResource(
     _In_ ULONGLONG BaseAddress)
 {
     ULONG Index;
-    ULONG Count = ResourceList->lpVtbl->NumberOfEntriesOfType(ResourceList, ResourceType);
+    ULONG Count = ResourceList->NumberOfEntriesOfType(ResourceType);
 
     for (Index = 0; Index < Count; ++Index)
     {
-        PCM_PARTIAL_RESOURCE_DESCRIPTOR Descriptor =
-            ResourceList->lpVtbl->FindTranslatedEntry(ResourceList, ResourceType, Index);
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR Descriptor = ResourceList->FindTranslatedEntry(ResourceType, Index);
         ULONGLONG ResourceAddress;
 
         if (Descriptor == NULL)
@@ -749,7 +680,7 @@ VirtioSndInitializePciResources(
     if (PhysicalDeviceObject == NULL)
         return STATUS_INVALID_DEVICE_STATE;
 
-    TranslatedResources = ResourceList->lpVtbl->TranslatedList(ResourceList);
+    TranslatedResources = ResourceList->TranslatedList();
     if (TranslatedResources == NULL || TranslatedResources->Count == 0)
     {
         DbgPrint("virtiosnd: Translated PCI resource list is empty\n");
@@ -820,12 +751,12 @@ VirtioSndReleasePciResources(_Inout_ PVIRTIO_SND_TRANSPORT Transport)
 }
 
 static NTSTATUS
-VirtioSndConnectInterrupt(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _In_ PRESOURCELIST ResourceList)
+VirtioSndConnectInterrupt(_Inout_ CVirtioSndAdapter *Adapter, _In_ PRESOURCELIST ResourceList)
 {
     PCM_PARTIAL_RESOURCE_DESCRIPTOR InterruptResource;
     KINTERRUPT_MODE InterruptMode;
 
-    InterruptResource = ResourceList->lpVtbl->FindTranslatedEntry(ResourceList, CmResourceTypeInterrupt, 0);
+    InterruptResource = ResourceList->FindTranslatedEntry(CmResourceTypeInterrupt, 0);
     if (InterruptResource == NULL)
     {
         DbgPrint("virtiosnd: No translated interrupt resource was assigned\n");
@@ -840,8 +771,11 @@ VirtioSndConnectInterrupt(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _In_ PRESOURCELIS
         InterruptResource->ShareDisposition == CmResourceShareShared, InterruptResource->u.Interrupt.Affinity, FALSE);
 }
 
+/*
+ * Reset the adapter's transport state to a clean, reusable baseline.
+ */
 static VOID
-VirtioSndShutdownAdapter(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
+VirtioSndShutdownAdapter(_Inout_ CVirtioSndAdapter *Adapter)
 {
     InterlockedExchange(&Adapter->Stopping, TRUE);
 
@@ -893,30 +827,55 @@ VirtioSndShutdownAdapter(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
         virtio_device_shutdown(&Adapter->Device);
 
     VirtioSndReleasePciResources(&Adapter->Transport);
-    RtlZeroMemory(Adapter, sizeof(*Adapter));
+
+    /* Clear the transport data members (preserving the C++ object header). */
+    Adapter->OwnerDeviceObject = NULL;
+    RtlZeroMemory(&Adapter->Transport, sizeof(Adapter->Transport));
+    RtlZeroMemory(&Adapter->Device, sizeof(Adapter->Device));
+    RtlZeroMemory(&Adapter->Config, sizeof(Adapter->Config));
+    Adapter->HostFeatures = 0;
+    Adapter->DriverFeatures = 0;
+    RtlZeroMemory(Adapter->Queues, sizeof(Adapter->Queues));
+    Adapter->PcmInfo = NULL;
+    Adapter->PcmInfoCount = 0;
+    Adapter->ChannelMapInfo = NULL;
+    Adapter->ChannelMapInfoCount = 0;
+    Adapter->EventSlots = NULL;
+    Adapter->EventSlotCount = 0;
+    Adapter->OutstandingBuffer = NULL;
+    Adapter->DeviceInitializeAttempted = FALSE;
+    Adapter->DeviceInitialized = FALSE;
+    Adapter->QueuesInitialized = FALSE;
+    Adapter->Started = FALSE;
+    Adapter->InterruptObject = NULL;
+    RtlZeroMemory(&Adapter->InterruptDpc, sizeof(Adapter->InterruptDpc));
+    RtlZeroMemory(&Adapter->PlaybackLock, sizeof(Adapter->PlaybackLock));
+    Adapter->PlaybackEvent = NULL;
+    Adapter->PlaybackContext = NULL;
+    Adapter->Stopping = 0;
+    Adapter->PlaybackOpen = 0;
 }
 
 VOID
-VirtioSndStopTransport(_In_opt_ PDEVICE_OBJECT DeviceObject)
+CVirtioSndAdapter::StopTransport(_In_opt_ PDEVICE_OBJECT DeviceObject)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     PKEVENT WakeEvent = NULL;
     BOOLEAN WaitForPlayback = FALSE;
 
     VirtioSndInitializeSynchronization();
     VirtioSndAcquireLifecycleLock();
 
-    if (Adapter->OwnerDeviceObject == NULL || (DeviceObject != NULL && Adapter->OwnerDeviceObject != DeviceObject))
+    if (OwnerDeviceObject == NULL || (DeviceObject != NULL && OwnerDeviceObject != DeviceObject))
     {
         VirtioSndReleaseLifecycleLock();
         return;
     }
 
-    InterlockedExchange(&Adapter->Stopping, TRUE);
-    if (Adapter->PlaybackContext != NULL)
+    InterlockedExchange(&Stopping, TRUE);
+    if (PlaybackContext != NULL)
     {
-        WakeEvent = Adapter->PlaybackContext->WakeEvent;
-        WaitForPlayback = !KeReadStateEvent(&VirtioSndPlaybackQuiesced);
+        WakeEvent = PlaybackContext->WakeEvent;
+        WaitForPlayback = !KeReadStateEvent(&PlaybackQuiesced);
     }
 
     if (WakeEvent != NULL)
@@ -925,20 +884,20 @@ VirtioSndStopTransport(_In_opt_ PDEVICE_OBJECT DeviceObject)
 
     if (WaitForPlayback)
     {
-        KeWaitForSingleObject(&VirtioSndPlaybackQuiesced, Executive, KernelMode, FALSE, NULL);
+        KeWaitForSingleObject(&PlaybackQuiesced, Executive, KernelMode, FALSE, NULL);
     }
 
     VirtioSndAcquireLifecycleLock();
-    if (Adapter->OwnerDeviceObject != NULL && (DeviceObject == NULL || Adapter->OwnerDeviceObject == DeviceObject))
+    if (OwnerDeviceObject != NULL && (DeviceObject == NULL || OwnerDeviceObject == DeviceObject))
     {
-        VirtioSndShutdownAdapter(Adapter);
+        VirtioSndShutdownAdapter(this);
     }
     VirtioSndReleaseLifecycleLock();
-    KeSetEvent(&VirtioSndTransportStopped, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&TransportStopped, IO_NO_INCREMENT, FALSE);
 }
 
 static NTSTATUS
-VirtioSndQueryPcmInfo(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
+VirtioSndQueryPcmInfo(_Inout_ CVirtioSndAdapter *Adapter)
 {
     const SIZE_T StatusOffset = sizeof(VIRTIO_SND_QUERY_INFO);
     const SIZE_T InfoOffset = (sizeof(VIRTIO_SND_QUERY_INFO) + sizeof(VIRTIO_SND_HDR) + 7) & ~(SIZE_T)7;
@@ -1089,7 +1048,7 @@ VirtioSndQueryPcmInfo(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
             (ULONG)Info->Rates);
     }
 
-    Adapter->PcmInfo = VirtioSndAllocateNonpaged(NULL, InfoLength);
+    Adapter->PcmInfo = (PVIRTIO_SND_PCM_INFO)VirtioSndAllocateNonpaged(NULL, InfoLength);
     if (Adapter->PcmInfo == NULL)
     {
         Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1105,7 +1064,7 @@ Exit:
 }
 
 static NTSTATUS
-VirtioSndQueryChannelMaps(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
+VirtioSndQueryChannelMaps(_Inout_ CVirtioSndAdapter *Adapter)
 {
     const SIZE_T StatusOffset = sizeof(VIRTIO_SND_QUERY_INFO);
     const SIZE_T InfoOffset = (sizeof(VIRTIO_SND_QUERY_INFO) + sizeof(VIRTIO_SND_HDR) + 7) & ~(SIZE_T)7;
@@ -1236,7 +1195,7 @@ VirtioSndQueryChannelMaps(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
             Info->Positions[2], Info->Positions[3]);
     }
 
-    Adapter->ChannelMapInfo = VirtioSndAllocateNonpaged(NULL, InfoLength);
+    Adapter->ChannelMapInfo = (PVIRTIO_SND_CHMAP_INFO)VirtioSndAllocateNonpaged(NULL, InfoLength);
     if (Adapter->ChannelMapInfo == NULL)
     {
         Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1256,9 +1215,8 @@ Exit:
 }
 
 NTSTATUS
-VirtioSndGetPlaybackChannelMap(_In_ ULONG Channels, _Out_writes_bytes_(Channels) PUCHAR Positions)
+CVirtioSndAdapter::GetPlaybackChannelMap(_In_ ULONG Channels, _Out_writes_bytes_(Channels) PUCHAR Positions)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     PVIRTIO_SND_CHMAP_INFO Match = NULL;
     ULONG MapIndex;
 
@@ -1268,14 +1226,14 @@ VirtioSndGetPlaybackChannelMap(_In_ ULONG Channels, _Out_writes_bytes_(Channels)
     {
         return STATUS_INVALID_PARAMETER;
     }
-    if (!Adapter->Started || VirtioSndTransportStopping())
+    if (!Started || TransportStopping())
         return STATUS_DEVICE_NOT_READY;
-    if (Adapter->ChannelMapInfo == NULL)
+    if (ChannelMapInfo == NULL)
         return STATUS_NOT_SUPPORTED;
 
-    for (MapIndex = 0; MapIndex < Adapter->ChannelMapInfoCount; ++MapIndex)
+    for (MapIndex = 0; MapIndex < ChannelMapInfoCount; ++MapIndex)
     {
-        PVIRTIO_SND_CHMAP_INFO Candidate = &Adapter->ChannelMapInfo[MapIndex];
+        PVIRTIO_SND_CHMAP_INFO Candidate = &ChannelMapInfo[MapIndex];
 
         if (Candidate->Direction != VIRTIO_SND_D_OUTPUT || Candidate->Channels != Channels)
         {
@@ -1297,9 +1255,8 @@ VirtioSndGetPlaybackChannelMap(_In_ ULONG Channels, _Out_writes_bytes_(Channels)
 }
 
 NTSTATUS
-VirtioSndGetPlaybackRates(_In_ ULONG Channels, _In_ ULONG BitsPerSample, _Out_ ULONGLONG *Rates)
+CVirtioSndAdapter::GetPlaybackRates(_In_ ULONG Channels, _In_ ULONG BitsPerSample, _Out_ ULONGLONG *Rates)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     ULONG Format;
     ULONGLONG FormatBit;
     ULONG StreamId;
@@ -1321,15 +1278,15 @@ VirtioSndGetPlaybackRates(_In_ ULONG Channels, _In_ ULONG BitsPerSample, _Out_ U
     *Rates = 0;
     VirtioSndInitializeSynchronization();
     VirtioSndAcquireLifecycleLock();
-    if (!Adapter->Started || VirtioSndTransportStopping())
+    if (!Started || TransportStopping())
     {
         Status = STATUS_DEVICE_NOT_READY;
         goto Exit;
     }
 
-    for (StreamId = 0; StreamId < Adapter->PcmInfoCount; ++StreamId)
+    for (StreamId = 0; StreamId < PcmInfoCount; ++StreamId)
     {
-        PVIRTIO_SND_PCM_INFO Info = &Adapter->PcmInfo[StreamId];
+        PVIRTIO_SND_PCM_INFO Info = &PcmInfo[StreamId];
 
         if (Info->Direction == VIRTIO_SND_D_OUTPUT && (Info->Formats & FormatBit) != 0 &&
             Info->ChannelsMin <= Channels && Info->ChannelsMax >= Channels)
@@ -1370,7 +1327,7 @@ VirtioSndGetRateIndex(_In_ ULONG SampleRate, _Out_ PULONG RateIndex)
 
 static NTSTATUS
 VirtioSndSubmitControlRequest(
-    _Inout_ PVIRTIO_SND_ADAPTER Adapter,
+    _Inout_ CVirtioSndAdapter *Adapter,
     _In_reads_bytes_(RequestLength) PVOID Request,
     _In_ SIZE_T RequestLength)
 {
@@ -1468,7 +1425,7 @@ Exit:
 }
 
 static NTSTATUS
-VirtioSndSendPcmCommand(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _In_ ULONG Code, _In_ ULONG StreamId)
+VirtioSndSendPcmCommand(_Inout_ CVirtioSndAdapter *Adapter, _In_ ULONG Code, _In_ ULONG StreamId)
 {
     VIRTIO_SND_PCM_HDR Request;
 
@@ -1480,14 +1437,13 @@ VirtioSndSendPcmCommand(_Inout_ PVIRTIO_SND_ADAPTER Adapter, _In_ ULONG Code, _I
 }
 
 NTSTATUS
-VirtioSndOpenPlayback(
+CVirtioSndAdapter::OpenPlayback(
     _In_ ULONG Channels,
     _In_ ULONG BitsPerSample,
     _In_ ULONG SampleRate,
     _In_ PKEVENT WakeEvent,
     _Out_ PVIRTIO_SND_PLAYBACK *Playback)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     PVIRTIO_SND_PLAYBACK Context;
     VIRTIO_SND_PCM_SET_PARAMS Request;
     ULONG StreamId;
@@ -1514,21 +1470,21 @@ VirtioSndOpenPlayback(
     *Playback = NULL;
     VirtioSndInitializeSynchronization();
     VirtioSndAcquireLifecycleLock();
-    if (!Adapter->Started || VirtioSndTransportStopping() || Adapter->Queues[VIRTIO_SND_VQ_TX] == NULL)
+    if (!Started || TransportStopping() || Queues[VIRTIO_SND_VQ_TX] == NULL)
     {
         Status = STATUS_DEVICE_NOT_READY;
         goto Failure;
     }
 
-    if (InterlockedCompareExchange(&Adapter->PlaybackOpen, 1, 0) != 0)
+    if (InterlockedCompareExchange(&PlaybackOpen, 1, 0) != 0)
     {
         Status = STATUS_DEVICE_BUSY;
         goto Failure;
     }
 
-    for (StreamId = 0; StreamId < Adapter->PcmInfoCount; ++StreamId)
+    for (StreamId = 0; StreamId < PcmInfoCount; ++StreamId)
     {
-        PVIRTIO_SND_PCM_INFO Info = &Adapter->PcmInfo[StreamId];
+        PVIRTIO_SND_PCM_INFO Info = &PcmInfo[StreamId];
         ULONGLONG FormatBit = (ULONGLONG)1 << Format;
         ULONGLONG RateBit = (ULONGLONG)1 << RateIndex;
 
@@ -1540,23 +1496,24 @@ VirtioSndOpenPlayback(
         }
     }
 
-    if (StreamId == Adapter->PcmInfoCount)
+    if (StreamId == PcmInfoCount)
         goto Failure;
 
-    Context = VirtioSndAllocateNonpaged(NULL, sizeof(*Context));
+    Context = (PVIRTIO_SND_PLAYBACK)VirtioSndAllocateNonpaged(NULL, sizeof(*Context));
     if (Context == NULL)
     {
         Status = STATUS_INSUFFICIENT_RESOURCES;
         goto Failure;
     }
 
+    Context->Adapter = this;
     Context->StreamId = StreamId;
     Context->Channels = Channels;
     Context->Features = StreamFeatures;
     Context->WakeEvent = WakeEvent;
     for (SlotIndex = 0; SlotIndex < VIRTIO_SND_TX_SLOT_COUNT; ++SlotIndex)
     {
-        Context->Slots[SlotIndex] = VirtioSndAllocateContiguous(NULL, sizeof(VIRTIO_SND_TX_SLOT));
+        Context->Slots[SlotIndex] = (PVIRTIO_SND_TX_SLOT)VirtioSndAllocateContiguous(NULL, sizeof(VIRTIO_SND_TX_SLOT));
         if (Context->Slots[SlotIndex] == NULL)
         {
             Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1576,16 +1533,16 @@ VirtioSndOpenPlayback(
     Request.Format = (UCHAR)Format;
     Request.Rate = (UCHAR)RateIndex;
 
-    Status = VirtioSndSubmitControlRequest(Adapter, &Request, sizeof(Request));
+    Status = VirtioSndSubmitControlRequest(this, &Request, sizeof(Request));
     if (!NT_SUCCESS(Status))
         goto ContextFailure;
 
-    Status = VirtioSndSendPcmCommand(Adapter, VIRTIO_SND_R_PCM_PREPARE, StreamId);
+    Status = VirtioSndSendPcmCommand(this, VIRTIO_SND_R_PCM_PREPARE, StreamId);
     if (!NT_SUCCESS(Status))
     {
         if (Status != STATUS_IO_TIMEOUT)
         {
-            NTSTATUS ReleaseStatus = VirtioSndSendPcmCommand(Adapter, VIRTIO_SND_R_PCM_RELEASE, StreamId);
+            NTSTATUS ReleaseStatus = VirtioSndSendPcmCommand(this, VIRTIO_SND_R_PCM_RELEASE, StreamId);
             if (!NT_SUCCESS(ReleaseStatus))
                 DbgPrint("virtiosnd: PCM Release after prepare failure returned %08lx\n", (ULONG)ReleaseStatus);
         }
@@ -1593,13 +1550,13 @@ VirtioSndOpenPlayback(
     }
 
     Context->Prepared = TRUE;
-    virtqueue_disable_cb(Adapter->Queues[VIRTIO_SND_VQ_TX]);
+    virtqueue_disable_cb(Queues[VIRTIO_SND_VQ_TX]);
     Context->DeviceActive = TRUE;
-    KeAcquireSpinLock(&Adapter->PlaybackLock, &OldIrql);
-    Adapter->PlaybackContext = Context;
-    Adapter->PlaybackEvent = WakeEvent;
-    KeReleaseSpinLock(&Adapter->PlaybackLock, OldIrql);
-    KeClearEvent(&VirtioSndPlaybackQuiesced);
+    KeAcquireSpinLock(&PlaybackLock, &OldIrql);
+    PlaybackContext = Context;
+    PlaybackEvent = WakeEvent;
+    KeReleaseSpinLock(&PlaybackLock, OldIrql);
+    KeClearEvent(&PlaybackQuiesced);
     *Playback = Context;
     DbgPrint(
         "virtiosnd: Prepared %lu Hz S%lu playback stream %lu (%lu channels)\n", SampleRate, BitsPerSample, StreamId,
@@ -1613,13 +1570,13 @@ ContextFailure:
         VirtioSndFreeContiguous(NULL, Context->Slots[SlotIndex]);
     VirtioSndFreeNonpaged(NULL, Context);
 Failure:
-    InterlockedExchange(&Adapter->PlaybackOpen, 0);
+    InterlockedExchange(&PlaybackOpen, 0);
     VirtioSndReleaseLifecycleLock();
     return Status;
 }
 
 NTSTATUS
-VirtioSndStartPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
+CVirtioSndAdapter::StartPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 {
     NTSTATUS Status;
 
@@ -1627,16 +1584,16 @@ VirtioSndStartPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 
     if (Playback == NULL || !Playback->Prepared)
         return STATUS_INVALID_DEVICE_STATE;
-    if (!Playback->DeviceActive || VirtioSndTransportStopping() || !VirtioSndAdapter.Started)
+    if (!Playback->DeviceActive || TransportStopping() || !Started)
         return STATUS_DEVICE_NOT_READY;
     if (Playback->Started)
         return STATUS_SUCCESS;
 
-    Status = VirtioSndSendPcmCommand(&VirtioSndAdapter, VIRTIO_SND_R_PCM_START, Playback->StreamId);
+    Status = VirtioSndSendPcmCommand(this, VIRTIO_SND_R_PCM_START, Playback->StreamId);
     if (NT_SUCCESS(Status))
     {
         Playback->Started = TRUE;
-        if (!virtqueue_enable_cb(VirtioSndAdapter.Queues[VIRTIO_SND_VQ_TX]))
+        if (!virtqueue_enable_cb(Queues[VIRTIO_SND_VQ_TX]))
         {
             KeSetEvent(Playback->WakeEvent, IO_NO_INCREMENT, FALSE);
         }
@@ -1651,7 +1608,7 @@ VirtioSndGetCompletedTxSlot(
     _Out_ PVIRTIO_SND_TX_SLOT *CompletedSlot,
     _Out_ unsigned int *UsedLength)
 {
-    struct virtqueue *TxQueue = VirtioSndAdapter.Queues[VIRTIO_SND_VQ_TX];
+    struct virtqueue *TxQueue = Playback->Adapter->Queues[VIRTIO_SND_VQ_TX];
     PVIRTIO_SND_TX_SLOT Slot;
     ULONG SlotIndex;
 
@@ -1679,7 +1636,7 @@ VirtioSndGetCompletedTxSlot(
 }
 
 NTSTATUS
-VirtioSndGetPlaybackCompletion(
+CVirtioSndAdapter::GetPlaybackCompletion(
     _Inout_ PVIRTIO_SND_PLAYBACK Playback,
     _Out_ PULONG DeviceStatus,
     _Out_ PULONG LatencyBytes)
@@ -1703,14 +1660,14 @@ VirtioSndGetPlaybackCompletion(
 }
 
 NTSTATUS
-VirtioSndProcessPlaybackEvents(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _Out_ PULONG XrunCount)
+CVirtioSndAdapter::ProcessPlaybackEvents(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _Out_ PULONG XrunCount)
 {
     NTSTATUS Status;
 
     if (Playback == NULL || XrunCount == NULL)
         return STATUS_INVALID_PARAMETER;
 
-    Status = VirtioSndDrainEventQueue(&VirtioSndAdapter, Playback, XrunCount);
+    Status = VirtioSndDrainEventQueue(this, Playback, XrunCount);
     if (!NT_SUCCESS(Status))
         return Status;
 
@@ -1730,12 +1687,11 @@ VirtioSndProcessPlaybackEvents(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _Out_ PULO
 }
 
 BOOLEAN
-VirtioSndArmPlaybackCompletion(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
+CVirtioSndAdapter::ArmPlaybackCompletion(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 {
-    struct virtqueue *TxQueue = VirtioSndAdapter.Queues[VIRTIO_SND_VQ_TX];
+    struct virtqueue *TxQueue = Queues[VIRTIO_SND_VQ_TX];
 
-    if (Playback == NULL || !Playback->DeviceActive || !Playback->Started || TxQueue == NULL ||
-        VirtioSndTransportStopping())
+    if (Playback == NULL || !Playback->DeviceActive || !Playback->Started || TxQueue == NULL || TransportStopping())
     {
         return FALSE;
     }
@@ -1744,17 +1700,18 @@ VirtioSndArmPlaybackCompletion(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 }
 
 BOOLEAN
-VirtioSndPlaybackIsActive(_In_ PVIRTIO_SND_PLAYBACK Playback)
+CVirtioSndAdapter::PlaybackIsActive(_In_ PVIRTIO_SND_PLAYBACK Playback)
 {
-    return Playback != NULL && Playback->DeviceActive && VirtioSndAdapter.PlaybackContext == Playback &&
-           VirtioSndAdapter.Started && !VirtioSndTransportStopping();
+    return Playback != NULL && Playback->DeviceActive && PlaybackContext == Playback && Started && !TransportStopping();
 }
 
 NTSTATUS
-VirtioSndQueuePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _In_reads_bytes_(Length) PVOID Audio, _In_ ULONG Length)
+CVirtioSndAdapter::QueuePlayback(
+    _Inout_ PVIRTIO_SND_PLAYBACK Playback,
+    _In_reads_bytes_(Length) PVOID Audio,
+    _In_ ULONG Length)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
-    struct virtqueue *TxQueue = Adapter->Queues[VIRTIO_SND_VQ_TX];
+    struct virtqueue *TxQueue = Queues[VIRTIO_SND_VQ_TX];
     struct scatterlist ScatterList[3];
     PVIRTIO_SND_TX_SLOT Slot = NULL;
     PHYSICAL_ADDRESS PhysicalAddress;
@@ -1762,7 +1719,7 @@ VirtioSndQueuePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _In_reads_bytes_(L
     INT AddResult;
 
     if (Playback == NULL || Audio == NULL || Length != VIRTIO_SND_PCM_PERIOD_BYTES || !Playback->DeviceActive ||
-        VirtioSndTransportStopping() || !Playback->Started || TxQueue == NULL)
+        TransportStopping() || !Playback->Started || TxQueue == NULL)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1804,7 +1761,7 @@ VirtioSndQueuePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback, _In_reads_bytes_(L
 }
 
 NTSTATUS
-VirtioSndStopPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
+CVirtioSndAdapter::StopPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 {
     ULONG Retry;
     NTSTATUS Status = STATUS_SUCCESS;
@@ -1816,7 +1773,7 @@ VirtioSndStopPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 
     if (!Playback->DeviceActive)
         return STATUS_DEVICE_NOT_READY;
-    virtqueue_disable_cb(VirtioSndAdapter.Queues[VIRTIO_SND_VQ_TX]);
+    virtqueue_disable_cb(Queues[VIRTIO_SND_VQ_TX]);
 
     for (Retry = 0; Playback->InFlightCount != 0 && Retry < VIRTIO_SND_CONTROL_TIMEOUT_MS; ++Retry)
     {
@@ -1837,7 +1794,7 @@ VirtioSndStopPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 
     if (Playback->Started)
     {
-        Status = VirtioSndSendPcmCommand(&VirtioSndAdapter, VIRTIO_SND_R_PCM_STOP, Playback->StreamId);
+        Status = VirtioSndSendPcmCommand(this, VIRTIO_SND_R_PCM_STOP, Playback->StreamId);
         if (!NT_SUCCESS(Status))
             return Status;
         Playback->Started = FALSE;
@@ -1847,9 +1804,8 @@ VirtioSndStopPlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 }
 
 VOID
-VirtioSndClosePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
+CVirtioSndAdapter::ClosePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     ULONG SlotIndex;
     NTSTATUS Status;
     KIRQL OldIrql;
@@ -1864,58 +1820,58 @@ VirtioSndClosePlayback(_Inout_ PVIRTIO_SND_PLAYBACK Playback)
 
 Retry:
     VirtioSndAcquireLifecycleLock();
-    if (Playback->DeviceActive && VirtioSndTransportStopping())
+    if (Playback->DeviceActive && TransportStopping())
     {
         VirtioSndReleaseLifecycleLock();
-        KeWaitForSingleObject(&VirtioSndTransportStopped, Executive, KernelMode, FALSE, NULL);
+        KeWaitForSingleObject(&TransportStopped, Executive, KernelMode, FALSE, NULL);
         goto Retry;
     }
 
-    if (Playback->DeviceActive && Adapter->QueuesInitialized)
+    if (Playback->DeviceActive && QueuesInitialized)
     {
-        Status = VirtioSndStopPlayback(Playback);
+        Status = StopPlayback(Playback);
         if (!NT_SUCCESS(Status))
         {
             DbgPrint(
                 "virtiosnd: Playback stop failed (%08lx). Resetting device before freeing DMA "
                 "buffers\n",
                 (ULONG)Status);
-            virtio_device_reset(&Adapter->Device);
-            if (Adapter->QueuesInitialized)
+            virtio_device_reset(&Device);
+            if (QueuesInitialized)
             {
-                virtio_delete_queues(&Adapter->Device);
-                Adapter->QueuesInitialized = FALSE;
+                virtio_delete_queues(&Device);
+                QueuesInitialized = FALSE;
             }
-            Adapter->Started = FALSE;
+            Started = FALSE;
         }
 
-        if (Playback->Prepared && Adapter->QueuesInitialized)
+        if (Playback->Prepared && QueuesInitialized)
         {
-            Status = VirtioSndSendPcmCommand(Adapter, VIRTIO_SND_R_PCM_RELEASE, Playback->StreamId);
+            Status = VirtioSndSendPcmCommand(this, VIRTIO_SND_R_PCM_RELEASE, Playback->StreamId);
             if (!NT_SUCCESS(Status))
                 DbgPrint("virtiosnd: PCM Release failed with status %08lx\n", (ULONG)Status);
         }
     }
 
     Playback->DeviceActive = FALSE;
-    OwnsAdapterContext = Adapter->PlaybackContext == Playback;
+    OwnsAdapterContext = PlaybackContext == Playback;
     if (OwnsAdapterContext)
     {
-        KeAcquireSpinLock(&Adapter->PlaybackLock, &OldIrql);
-        Adapter->PlaybackContext = NULL;
-        Adapter->PlaybackEvent = NULL;
-        KeReleaseSpinLock(&Adapter->PlaybackLock, OldIrql);
+        KeAcquireSpinLock(&PlaybackLock, &OldIrql);
+        PlaybackContext = NULL;
+        PlaybackEvent = NULL;
+        KeReleaseSpinLock(&PlaybackLock, OldIrql);
     }
     for (SlotIndex = 0; SlotIndex < VIRTIO_SND_TX_SLOT_COUNT; ++SlotIndex)
         VirtioSndFreeContiguous(NULL, Playback->Slots[SlotIndex]);
     VirtioSndFreeNonpaged(NULL, Playback);
     if (OwnsAdapterContext)
-        InterlockedExchange(&Adapter->PlaybackOpen, 0);
+        InterlockedExchange(&PlaybackOpen, 0);
     VirtioSndReleaseLifecycleLock();
 }
 
 static NTSTATUS
-VirtioSndProbePcmParameters(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
+VirtioSndProbePcmParameters(_Inout_ CVirtioSndAdapter *Adapter)
 {
     ULONG StreamId;
     ULONG PlaybackStream = MAXULONG;
@@ -1991,9 +1947,8 @@ VirtioSndProbePcmParameters(_Inout_ PVIRTIO_SND_ADAPTER Adapter)
 }
 
 NTSTATUS
-VirtioSndStartTransport(_In_ PDEVICE_OBJECT DeviceObject, _In_ PRESOURCELIST ResourceList)
+CVirtioSndAdapter::StartTransport(_In_ PDEVICE_OBJECT DeviceObject, _In_ PRESOURCELIST ResourceList)
 {
-    PVIRTIO_SND_ADAPTER Adapter = &VirtioSndAdapter;
     ULONGLONG DriverFeatures = 0;
     ULONG QueueIndex;
     NTSTATUS Status;
@@ -2003,113 +1958,105 @@ VirtioSndStartTransport(_In_ PDEVICE_OBJECT DeviceObject, _In_ PRESOURCELIST Res
     VirtioSndInitializeSynchronization();
     VirtioSndAcquireLifecycleLock();
 
-    if (Adapter->Started || Adapter->PlaybackContext != NULL)
+    if (Started || PlaybackContext != NULL)
     {
         VirtioSndReleaseLifecycleLock();
         return STATUS_DEVICE_BUSY;
     }
 
-    if (Adapter->OwnerDeviceObject != NULL && Adapter->OwnerDeviceObject != DeviceObject)
-    {
-        DbgPrint("virtiosnd: This prototype already owns another device\n");
-        VirtioSndReleaseLifecycleLock();
-        return STATUS_DEVICE_BUSY;
-    }
+    VirtioSndShutdownAdapter(this);
+    OwnerDeviceObject = DeviceObject;
+    KeInitializeSpinLock(&PlaybackLock);
+    KeInitializeDpc(&InterruptDpc, VirtioSndInterruptDpc, this);
+    InterlockedExchange(&Stopping, FALSE);
+    KeClearEvent(&TransportStopped);
 
-    VirtioSndShutdownAdapter(Adapter);
-    Adapter->OwnerDeviceObject = DeviceObject;
-    KeInitializeSpinLock(&Adapter->PlaybackLock);
-    KeInitializeDpc(&Adapter->InterruptDpc, VirtioSndInterruptDpc, Adapter);
-    InterlockedExchange(&Adapter->Stopping, FALSE);
-    KeClearEvent(&VirtioSndTransportStopped);
-
-    Status = VirtioSndInitializePciResources(DeviceObject, ResourceList, &Adapter->Transport);
+    Status = VirtioSndInitializePciResources(DeviceObject, ResourceList, &Transport);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: PCI Resource initialization failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    Adapter->DeviceInitializeAttempted = TRUE;
-    Status = virtio_device_initialize(&Adapter->Device, &VirtioSndSystemOps, &Adapter->Transport, FALSE);
+    DeviceInitializeAttempted = TRUE;
+    Status = virtio_device_initialize(&Device, &VirtioSndSystemOps, &Transport, FALSE);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: VirtIO Transport initialization failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    Adapter->DeviceInitialized = TRUE;
-    Adapter->HostFeatures = virtio_get_features(&Adapter->Device);
-    if (virtio_is_feature_enabled(Adapter->HostFeatures, VIRTIO_F_VERSION_1))
+    DeviceInitialized = TRUE;
+    HostFeatures = virtio_get_features(&Device);
+    if (virtio_is_feature_enabled(HostFeatures, VIRTIO_F_VERSION_1))
         virtio_feature_enable(DriverFeatures, VIRTIO_F_VERSION_1);
-    Adapter->DriverFeatures = DriverFeatures;
+    this->DriverFeatures = DriverFeatures;
 
-    Status = virtio_set_features(&Adapter->Device, Adapter->DriverFeatures);
+    Status = virtio_set_features(&Device, this->DriverFeatures);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(
             "virtiosnd: feature negotiation failed (host %08lx%08lx driver %08lx%08lx status "
             "%08lx)\n",
-            (ULONG)(Adapter->HostFeatures >> 32), (ULONG)Adapter->HostFeatures, (ULONG)(Adapter->DriverFeatures >> 32),
-            (ULONG)Adapter->DriverFeatures, (ULONG)Status);
+            (ULONG)(HostFeatures >> 32), (ULONG)HostFeatures, (ULONG)(this->DriverFeatures >> 32),
+            (ULONG)this->DriverFeatures, (ULONG)Status);
         goto Failure;
     }
 
-    if (Adapter->Device.config == NULL || Adapter->Device.config_len < sizeof(Adapter->Config))
+    if (Device.config == NULL || Device.config_len < sizeof(Config))
     {
         DbgPrint(
-            "virtiosnd: Invalid device config (address %p length %lu expected %lu)\n", Adapter->Device.config,
-            (ULONG)Adapter->Device.config_len, (ULONG)sizeof(Adapter->Config));
+            "virtiosnd: Invalid device config (address %p length %lu expected %lu)\n", Device.config,
+            (ULONG)Device.config_len, (ULONG)sizeof(Config));
         Status = STATUS_DEVICE_CONFIGURATION_ERROR;
         goto Failure;
     }
 
-    RtlZeroMemory(&Adapter->Config, sizeof(Adapter->Config));
-    virtio_get_config(&Adapter->Device, 0, &Adapter->Config, sizeof(Adapter->Config));
+    RtlZeroMemory(&Config, sizeof(Config));
+    virtio_get_config(&Device, 0, &Config, sizeof(Config));
 
     DbgPrint(
         "virtiosnd: Transport ready. Features %08lx%08lx, jacks %lu, streams %lu, channel "
         "maps %lu, controls %lu\n",
-        (ULONG)(Adapter->HostFeatures >> 32), (ULONG)Adapter->HostFeatures, Adapter->Config.Jacks,
-        Adapter->Config.Streams, Adapter->Config.ChannelMaps, Adapter->Config.Controls);
+        (ULONG)(HostFeatures >> 32), (ULONG)HostFeatures, Config.Jacks, Config.Streams, Config.ChannelMaps,
+        Config.Controls);
 
-    Status = virtio_find_queues(&Adapter->Device, VIRTIO_SND_VQ_MAX, Adapter->Queues);
+    Status = virtio_find_queues(&Device, VIRTIO_SND_VQ_MAX, Queues);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: Virtqueue setup failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
-    Adapter->QueuesInitialized = TRUE;
+    QueuesInitialized = TRUE;
 
     for (QueueIndex = 0; QueueIndex < VIRTIO_SND_VQ_MAX; ++QueueIndex)
     {
-        virtqueue_disable_cb(Adapter->Queues[QueueIndex]);
+        virtqueue_disable_cb(Queues[QueueIndex]);
         DbgPrint(
-            "virtiosnd: Queue %lu ready with %lu descriptors\n", QueueIndex,
-            virtio_get_queue_size(Adapter->Queues[QueueIndex]));
+            "virtiosnd: Queue %lu ready with %lu descriptors\n", QueueIndex, virtio_get_queue_size(Queues[QueueIndex]));
     }
 
-    Status = VirtioSndInitializeEventQueue(Adapter);
+    Status = VirtioSndInitializeEventQueue(this);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: Event queue setup failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    Status = VirtioSndConnectInterrupt(Adapter, ResourceList);
+    Status = VirtioSndConnectInterrupt(this, ResourceList);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: Interrupt connection failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    virtio_device_ready(&Adapter->Device);
+    virtio_device_ready(&Device);
     DbgPrint("virtiosnd: Device marked ready. Starting PCM info query\n");
-    if (virtqueue_kick_prepare(Adapter->Queues[VIRTIO_SND_VQ_EVENT]))
-        virtqueue_notify(Adapter->Queues[VIRTIO_SND_VQ_EVENT]);
+    if (virtqueue_kick_prepare(Queues[VIRTIO_SND_VQ_EVENT]))
+        virtqueue_notify(Queues[VIRTIO_SND_VQ_EVENT]);
     {
         ULONG InitialXrunCount;
-        Status = VirtioSndDrainEventQueue(Adapter, NULL, &InitialXrunCount);
+        Status = VirtioSndDrainEventQueue(this, NULL, &InitialXrunCount);
         if (!NT_SUCCESS(Status))
         {
             DbgPrint("virtiosnd: Event queue initialization failed with status %08lx\n", (ULONG)Status);
@@ -2117,21 +2064,21 @@ VirtioSndStartTransport(_In_ PDEVICE_OBJECT DeviceObject, _In_ PRESOURCELIST Res
         }
     }
 
-    Status = VirtioSndQueryPcmInfo(Adapter);
+    Status = VirtioSndQueryPcmInfo(this);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: PCM Info query failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    Status = VirtioSndQueryChannelMaps(Adapter);
+    Status = VirtioSndQueryChannelMaps(this);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint("virtiosnd: Channel-map query failed with status %08lx\n", (ULONG)Status);
         goto Failure;
     }
 
-    Status = VirtioSndProbePcmParameters(Adapter);
+    Status = VirtioSndProbePcmParameters(this);
     if (Status == STATUS_NOT_SUPPORTED)
     {
         DbgPrint("virtiosnd: Optional 48 kHz PCM setup probe is not supported\n");
@@ -2142,14 +2089,148 @@ VirtioSndStartTransport(_In_ PDEVICE_OBJECT DeviceObject, _In_ PRESOURCELIST Res
         goto Failure;
     }
 
-    Adapter->Started = TRUE;
+    Started = TRUE;
     DbgPrint("virtiosnd: adapter and queues retained after StartDevice\n");
     VirtioSndReleaseLifecycleLock();
     return STATUS_SUCCESS;
 
 Failure:
-    VirtioSndShutdownAdapter(Adapter);
-    KeSetEvent(&VirtioSndTransportStopped, IO_NO_INCREMENT, FALSE);
+    VirtioSndShutdownAdapter(this);
+    KeSetEvent(&TransportStopped, IO_NO_INCREMENT, FALSE);
     VirtioSndReleaseLifecycleLock();
     return Status;
+}
+
+/* Master volume/mute controls (formerly audio_controls.c). */
+
+LONG
+CVirtioSndAdapter::GetMasterVolume(VOID)
+{
+    return InterlockedCompareExchange(&MasterVolume, 0, 0);
+}
+
+NTSTATUS
+CVirtioSndAdapter::SetMasterVolume(_In_ LONG VolumeLevel)
+{
+    if (VolumeLevel < VIRTIO_SND_VOLUME_MINIMUM || VolumeLevel > VIRTIO_SND_VOLUME_MAXIMUM ||
+        VolumeLevel % VIRTIO_SND_VOLUME_STEP != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    InterlockedExchange(&MasterVolume, VolumeLevel);
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN
+CVirtioSndAdapter::GetMasterMute(VOID)
+{
+    return InterlockedCompareExchange(&MasterMute, 0, 0) != 0;
+}
+
+VOID
+CVirtioSndAdapter::SetMasterMute(_In_ BOOLEAN Muted)
+{
+    InterlockedExchange(&MasterMute, Muted ? TRUE : FALSE);
+}
+
+VOID
+CVirtioSndAdapter::ApplyMasterControls(
+    _Inout_updates_bytes_(Length) PVOID Audio,
+    _In_ ULONG Length,
+    _In_ ULONG BitsPerSample)
+{
+    LONG VolumeLevel;
+    LONG Gain;
+    LONG Step;
+    ULONG SampleCount;
+    ULONG SampleIndex;
+
+    if (Audio == NULL || Length == 0)
+        return;
+
+    if (GetMasterMute())
+    {
+        RtlZeroMemory(Audio, Length);
+        return;
+    }
+
+    VolumeLevel = GetMasterVolume();
+    if (VolumeLevel == VIRTIO_SND_VOLUME_MAXIMUM)
+        return;
+
+    Gain = 1 << 15;
+    for (Step = 0; Step < -VolumeLevel / VIRTIO_SND_VOLUME_STEP; ++Step)
+    {
+        Gain = (Gain * VIRTIO_SND_GAIN_ONE_DB_Q16 + (1 << 15)) >> 16;
+    }
+
+    if (BitsPerSample == 16)
+    {
+        PSHORT Samples = (PSHORT)Audio;
+
+        SampleCount = Length / sizeof(*Samples);
+        for (SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+        {
+            Samples[SampleIndex] = (SHORT)(((LONG)Samples[SampleIndex] * Gain) / (1 << 15));
+        }
+    }
+    else if (BitsPerSample == 32)
+    {
+        PLONG Samples = (PLONG)Audio;
+
+        SampleCount = Length / sizeof(*Samples);
+        for (SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+        {
+            Samples[SampleIndex] = (LONG)(((LONGLONG)Samples[SampleIndex] * Gain) / (1 << 15));
+        }
+    }
+}
+
+/*
+ * IAdapterPowerManagement. The power transitions are intentionally no-ops: see
+ * the class documentation in adapter.hpp.
+ */
+
+STDMETHODIMP_(NTSTATUS)
+CVirtioSndAdapter::QueryInterface(_In_ REFIID Interface, _Out_ PVOID *Object)
+{
+    if (Object == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    *Object = NULL;
+    if (IsEqualGUIDAligned(Interface, IID_IUnknown))
+    {
+        *Object = static_cast<IUnknown *>(static_cast<IAdapterPowerManagement *>(this));
+    }
+    else if (IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement))
+    {
+        *Object = static_cast<IAdapterPowerManagement *>(this);
+    }
+
+    if (*Object == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    AddRef();
+    return STATUS_SUCCESS;
+}
+
+STDMETHODIMP_(void)
+CVirtioSndAdapter::PowerChangeState(_In_ POWER_STATE NewState)
+{
+    DbgPrint("virtiosnd: adapter power change to device state %u\n", (ULONG)NewState.DeviceState);
+}
+
+STDMETHODIMP_(NTSTATUS)
+CVirtioSndAdapter::QueryPowerChangeState(_In_ POWER_STATE NewStateQuery)
+{
+    UNREFERENCED_PARAMETER(NewStateQuery);
+    return STATUS_SUCCESS;
+}
+
+STDMETHODIMP_(NTSTATUS)
+CVirtioSndAdapter::QueryDeviceCapabilities(_In_ PDEVICE_CAPABILITIES PowerDeviceCaps)
+{
+    UNREFERENCED_PARAMETER(PowerDeviceCaps);
+    return STATUS_SUCCESS;
 }

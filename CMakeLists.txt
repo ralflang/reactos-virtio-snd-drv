@@ -14,12 +14,11 @@ function(_configure_virtiosnd)
     endif()
 
     add_library(virtiosnd MODULE
-        "${VIRTIO_SND_SOURCE_DIR}/src/adapter.c"
-        "${VIRTIO_SND_SOURCE_DIR}/src/audio_controls.c"
-        "${VIRTIO_SND_SOURCE_DIR}/src/driver.c"
+        "${VIRTIO_SND_SOURCE_DIR}/src/adapter.cpp"
+        "${VIRTIO_SND_SOURCE_DIR}/src/driver.cpp"
         "${VIRTIO_SND_SOURCE_DIR}/src/topology.cpp"
-        "${VIRTIO_SND_SOURCE_DIR}/src/transport.c"
-        "${VIRTIO_SND_SOURCE_DIR}/src/virtio_debug.c"
+        "${VIRTIO_SND_SOURCE_DIR}/src/transport.cpp"
+        "${VIRTIO_SND_SOURCE_DIR}/src/virtio_debug.cpp"
         "${VIRTIO_SND_SOURCE_DIR}/src/wavecyclic.cpp"
         )
 
@@ -40,4 +39,4 @@ function(_configure_virtiosnd)
     add_driver_inf(virtiosnd "${VIRTIO_SND_SOURCE_DIR}/virtiosnd.inf")
 endfunction()
 
-cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _configure_virtiosnd)
+_configure_virtiosnd()

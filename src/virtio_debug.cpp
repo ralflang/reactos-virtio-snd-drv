@@ -15,20 +15,24 @@
  * @license GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  */
 
-#include <kdebugprint.h>
 #include <ntddk.h>
 
-/**
- * @brief Debug level for VirtIO sound driver
- */
-int virtioDebugLevel = 0;
+extern "C"
+{
+#include <kdebugprint.h>
 
-/**
- * @brief Flag to enable/disable debug printing
- */
-int bDebugPrint = 1;
+    /**
+     * @brief Debug level for VirtIO sound driver
+     */
+    int virtioDebugLevel = 0;
 
-/**
- * @brief Debug print function pointer
- */
-tDebugPrintFunc VirtioDebugPrintProc = (tDebugPrintFunc)DbgPrint;
+    /**
+     * @brief Flag to enable/disable debug printing
+     */
+    int bDebugPrint = 1;
+
+    /**
+     * @brief Debug print function pointer
+     */
+    tDebugPrintFunc VirtioDebugPrintProc = (tDebugPrintFunc)DbgPrint;
+}

@@ -15,9 +15,8 @@
  * @copyright Copyright 2026 Ralf Lang <ralf.lang@ralf-lang.de>
  */
 
-#include "virtiosnd.h"
-
-#include "kcom.h"
+#include "adapter.hpp"
+#include "kcom.hpp"
 #include <ksmedia.h>
 #include <stdunk.h>
 
@@ -53,6 +52,9 @@ VirtioSndVolumeProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest);
  */
 static NTSTATUS NTAPI
 VirtioSndMuteProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest);
+
+static CVirtioSndAdapter *
+VirtioSndGetPropertyAdapter(_In_ PPCPROPERTY_REQUEST PropertyRequest);
 
 static PCPROPERTY_ITEM g_VirtioSndVolumeProperties[] = {
     {&KSPROPSETID_Audio, KSPROPERTY_AUDIO_VOLUMELEVEL, VIRTIO_SND_VOLUME_ACCESS, VirtioSndVolumeProperty}};
@@ -231,14 +233,25 @@ VirtioSndVolumeProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest)
 
     if ((PropertyRequest->Verb & KSPROPERTY_TYPE_GET) != 0)
     {
-        *(PLONG)PropertyRequest->Value = VirtioSndGetMasterVolume();
+        CVirtioSndAdapter *Adapter = VirtioSndGetPropertyAdapter(PropertyRequest);
+        if (Adapter == NULL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        *(PLONG)PropertyRequest->Value = Adapter->GetMasterVolume();
         PropertyRequest->ValueSize = sizeof(LONG);
+        Adapter->Release();
         return STATUS_SUCCESS;
     }
 
     if ((PropertyRequest->Verb & KSPROPERTY_TYPE_SET) != 0)
     {
-        return VirtioSndSetMasterVolume(*(PLONG)PropertyRequest->Value);
+        CVirtioSndAdapter *Adapter = VirtioSndGetPropertyAdapter(PropertyRequest);
+        if (Adapter == NULL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        NTSTATUS Status = Adapter->SetMasterVolume(*(PLONG)PropertyRequest->Value);
+        Adapter->Release();
+        return Status;
     }
 
     return STATUS_INVALID_DEVICE_REQUEST;
@@ -273,8 +286,13 @@ VirtioSndMuteProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest)
 
     if ((PropertyRequest->Verb & KSPROPERTY_TYPE_GET) != 0)
     {
-        *(PULONG)PropertyRequest->Value = VirtioSndGetMasterMute() ? TRUE : FALSE;
+        CVirtioSndAdapter *Adapter = VirtioSndGetPropertyAdapter(PropertyRequest);
+        if (Adapter == NULL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        *(PULONG)PropertyRequest->Value = Adapter->GetMasterMute() ? TRUE : FALSE;
         PropertyRequest->ValueSize = sizeof(ULONG);
+        Adapter->Release();
         return STATUS_SUCCESS;
     }
 
@@ -284,7 +302,12 @@ VirtioSndMuteProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest)
         if (Muted > TRUE)
             return STATUS_INVALID_PARAMETER;
 
-        VirtioSndSetMasterMute(Muted != FALSE);
+        CVirtioSndAdapter *Adapter = VirtioSndGetPropertyAdapter(PropertyRequest);
+        if (Adapter == NULL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        Adapter->SetMasterMute(Muted != FALSE);
+        Adapter->Release();
         return STATUS_SUCCESS;
     }
 
@@ -299,16 +322,52 @@ VirtioSndMuteProperty(_In_ PPCPROPERTY_REQUEST PropertyRequest)
 class VirtioSndTopologyMiniport : public CUnknownImpl<IMiniportTopology>
 {
   public:
-    /**
-     * @brief Constructor for VirtioSndTopologyMiniport
-     */
-    VirtioSndTopologyMiniport()
+    explicit VirtioSndTopologyMiniport(_In_ CVirtioSndAdapter *Adapter) : m_Adapter(Adapter)
     {
+        m_Adapter->AddRef();
     }
 
     STDMETHODIMP_(NTSTATUS) QueryInterface(_In_ REFIID Interface, _Out_ PVOID *Object);
     IMP_IMiniportTopology;
+    ~VirtioSndTopologyMiniport()
+    {
+        m_Adapter->Release();
+    }
+
+    CVirtioSndAdapter *
+    GetAdapter(VOID)
+    {
+        return m_Adapter;
+    }
+
+  private:
+    CVirtioSndAdapter *m_Adapter;
 };
+
+static CVirtioSndAdapter *
+VirtioSndGetPropertyAdapter(_In_ PPCPROPERTY_REQUEST PropertyRequest)
+{
+    PVOID Object = NULL;
+    CVirtioSndAdapter *Adapter;
+
+    if (PropertyRequest->MajorTarget == NULL ||
+        !NT_SUCCESS(PropertyRequest->MajorTarget->QueryInterface(IID_IMiniportTopology, &Object)))
+    {
+        return NULL;
+    }
+
+    VirtioSndTopologyMiniport *Miniport =
+        static_cast<VirtioSndTopologyMiniport *>(static_cast<IMiniportTopology *>(Object));
+    Adapter = Miniport->GetAdapter();
+    if (Adapter == NULL)
+    {
+        PropertyRequest->MajorTarget->Release();
+        return NULL;
+    }
+    Adapter->AddRef();
+    PropertyRequest->MajorTarget->Release();
+    return Adapter;
+}
 
 /**
  * @brief Query interface implementation for topology miniport
@@ -433,13 +492,14 @@ VirtioSndCreateTopologyMiniport(
     _Out_ PUNKNOWN *Unknown,
     _In_ REFCLSID ClassId,
     _In_opt_ PUNKNOWN UnknownOuter,
+    _In_ CVirtioSndAdapter *Adapter,
     _In_ POOL_TYPE PoolType)
 {
     PAGED_CODE();
     UNREFERENCED_PARAMETER(ClassId);
     UNREFERENCED_PARAMETER(UnknownOuter);
 
-    VirtioSndTopologyMiniport *Object = new (PoolType, VIRTIO_SND_TOPOLOGY_POOL_TAG) VirtioSndTopologyMiniport();
+    VirtioSndTopologyMiniport *Object = new (PoolType, VIRTIO_SND_TOPOLOGY_POOL_TAG) VirtioSndTopologyMiniport(Adapter);
     if (Object == NULL)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -464,6 +524,7 @@ VirtioSndInstallTopologySubdevice(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP Irp,
     _In_ PRESOURCELIST ResourceList,
+    _In_ CVirtioSndAdapter *Adapter,
     _Out_ PUNKNOWN *TopologyUnknown)
 {
     PPORT Port = NULL;
@@ -472,7 +533,7 @@ VirtioSndInstallTopologySubdevice(
 
     PAGED_CODE();
 
-    if (DeviceObject == NULL || Irp == NULL || ResourceList == NULL || TopologyUnknown == NULL)
+    if (DeviceObject == NULL || Irp == NULL || ResourceList == NULL || Adapter == NULL || TopologyUnknown == NULL)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -483,7 +544,7 @@ VirtioSndInstallTopologySubdevice(
     if (!NT_SUCCESS(Status))
         return Status;
 
-    Status = VirtioSndCreateTopologyMiniport(&Miniport, CLSID_PortTopology, NULL, NonPagedPool);
+    Status = VirtioSndCreateTopologyMiniport(&Miniport, CLSID_PortTopology, NULL, Adapter, NonPagedPool);
     if (NT_SUCCESS(Status))
     {
         Status = Port->Init(DeviceObject, Irp, Miniport, NULL, ResourceList);
