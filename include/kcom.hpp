@@ -5,8 +5,8 @@
  * COPYRIGHT:   Copyright 2026 Ralf Lang <ralf.lang@ralf-lang.de>
  */
 
-#ifndef _VIRTIOSND_KCOM_H_
-#define _VIRTIOSND_KCOM_H_
+#ifndef _VIRTIOSND_KCOM_HPP_
+#define _VIRTIOSND_KCOM_HPP_
 
 #include <stdunk.h>
 
@@ -20,12 +20,17 @@
 template <typename... Interfaces> class CUnknownImpl : public Interfaces...
 {
   public:
+    /** @brief Increments and returns the object's reference count. */
     STDMETHODIMP_(ULONG)
     AddRef()
     {
         return InterlockedIncrement(&m_Ref);
     }
 
+    /**
+     * @brief Decrements the reference count and deletes the object at zero.
+     * @return Remaining reference count.
+     */
     STDMETHODIMP_(ULONG)
     Release()
     {
@@ -35,10 +40,12 @@ template <typename... Interfaces> class CUnknownImpl : public Interfaces...
         return Ref;
     }
 
+    /** @brief Destroys the reference-counted object. */
     virtual ~CUnknownImpl() = default;
 
   protected:
+    /** Current COM-style reference count. */
     volatile LONG m_Ref = 0;
 };
 
-#endif /* _VIRTIOSND_KCOM_H_ */
+#endif /* _VIRTIOSND_KCOM_HPP_ */

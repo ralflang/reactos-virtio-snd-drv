@@ -17,7 +17,7 @@
 
 /* INITGUID: Instantiate the storage for the GUIDs declared by portcls.h */
 #define INITGUID
-#include "virtiosnd.h"
+#include "adapter.hpp"
 
 /**
  * @brief Maximum number of miniports supported
@@ -32,8 +32,9 @@ static PDRIVER_DISPATCH VirtioSndPortClsPnpDispatch;
 /**
  * @brief PnP dispatch function for VirtIO sound driver
  *
- * This function handles PnP IRPs for the VirtIO sound driver. It specifically handles
- * stop and remove device notifications by stopping the transport layer.
+ * Handles PnP IRPs for the VirtIO sound driver. On STOP/REMOVE/SURPRISE_REMOVAL
+ * it tears down the transport and releases the adapter stored in the device
+ * extension.
  *
  * @param DeviceObject Pointer to the device object
  * @param Irp Pointer to the I/O request packet
@@ -44,9 +45,18 @@ VirtioSndPnpDispatch(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
     PIO_STACK_LOCATION IrpStack = IoGetCurrentIrpStackLocation(Irp);
 
-    if (IrpStack->MinorFunction == IRP_MN_STOP_DEVICE || IrpStack->MinorFunction == IRP_MN_REMOVE_DEVICE)
+    if (IrpStack->MinorFunction == IRP_MN_STOP_DEVICE || IrpStack->MinorFunction == IRP_MN_REMOVE_DEVICE ||
+        IrpStack->MinorFunction == IRP_MN_SURPRISE_REMOVAL)
     {
-        VirtioSndStopTransport(DeviceObject);
+        PVIRTIO_SND_DEVICE_EXTENSION DeviceExtension =
+            static_cast<PVIRTIO_SND_DEVICE_EXTENSION>(DeviceObject->DeviceExtension);
+
+        if (DeviceExtension != NULL && DeviceExtension->Adapter != NULL)
+        {
+            DeviceExtension->Adapter->StopTransport(DeviceObject);
+            DeviceExtension->Adapter->Release();
+            DeviceExtension->Adapter = NULL;
+        }
     }
 
     return VirtioSndPortClsPnpDispatch(DeviceObject, Irp);
@@ -68,7 +78,8 @@ VirtioSndAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physica
     PAGED_CODE();
 
     return PcAddAdapterDevice(
-        DriverObject, PhysicalDeviceObject, (PCPFNSTARTDEVICE)VirtioSndStartDevice, VIRTIO_SND_MAX_MINIPORTS, 0);
+        DriverObject, PhysicalDeviceObject, (PCPFNSTARTDEVICE)VirtioSndStartDevice, VIRTIO_SND_MAX_MINIPORTS,
+        sizeof(VIRTIO_SND_DEVICE_EXTENSION));
 }
 
 /**
@@ -81,8 +92,7 @@ VirtioSndAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physica
  * @param RegistryPath Pointer to the registry path
  * @return NTSTATUS Status of the operation
  */
-NTSTATUS
-NTAPI
+extern "C" NTSTATUS NTAPI
 DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
     NTSTATUS Status;
